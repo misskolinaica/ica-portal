@@ -101,10 +101,15 @@ function adminAuth(req, res, next) {
   });
 }
 // Only these fields can be written by the student/parent client:
-const PROGRESS_FIELDS = ['currentDay','completedDays','streak','dayActivities','rewardPicks','dailyDashboard','chatThread','startDate','timezone'];
+const PROGRESS_FIELDS = ['notifyEmail','currentDay','completedDays','streak','dayActivities','rewardPicks','dailyDashboard','chatThread','startDate','timezone'];
 
 // ─── STUDENT / PARENT ENDPOINTS (match the portal exactly) ────────────────
+// Public self-signup is OFF by default: only accounts the admin creates can log in.
+// To allow open registration, set Railway variable OPEN_REGISTRATION=true
 app.post('/api/register', async (req, res) => {
+  if (String(process.env.OPEN_REGISTRATION || '').toLowerCase() !== 'true') {
+    return res.status(403).json({ error: "Accounts are created by Coach after enrollment. Email kolina@heartofourfuturefoundation.com to join the Academy!" });
+  }
   const { playerName, email, password, timezone } = req.body || {};
   const em = (email || '').trim().toLowerCase();
   if (!playerName || !em || !password) return res.status(400).json({ error: 'Missing name, email, or password' });
@@ -223,6 +228,13 @@ app.post('/api/admin/students', adminAuth, async (req, res) => {
   };
   saveDB();
   res.json({ ok: true, email: em });
+  sendEmail(em, 'Welcome to the Inner Champion Academy Portal!',
+    brandEmail('Welcome, ' + playerName + '!',
+      `<p>Your champion's portal account is ready.</p>
+       <p><b>Website:</b> ${PORTAL_URL || 'the ICA portal'}<br>
+          <b>Email:</b> ${em}<br>
+          <b>Temporary password:</b> ${password}</p>
+       <p>Log in together and set up your first day — daily tasks, journal, class RSVPs, and messages with Coach are all inside.</p>`));
 });
 
 // Roster with per-student summary
@@ -264,8 +276,16 @@ app.put('/api/admin/students/:email', adminAuth, (req, res) => {
   const u = db.users[(req.params.email || '').toLowerCase()];
   if (!u) return res.status(404).json({ error: 'Student not found' });
   const allowed = ['assignedHouseTask', 'playerName'];
+  const taskChanged = ('assignedHouseTask' in (req.body || {})) && req.body.assignedHouseTask && req.body.assignedHouseTask !== u.assignedHouseTask;
   for (const k of allowed) if (k in (req.body || {})) u[k] = req.body[k];
   saveDB(); res.json({ ok: true });
+  if (taskChanged && u.notifyEmail !== false) {
+    sendEmail(u.email, "Today's house task for " + u.playerName,
+      brandEmail("Today's house task",
+        `<p>Coach posted a house task for ${u.playerName}:</p>
+         <p style="background:#F8E8A6;padding:12px 16px;border-radius:8px;"><b>${req.body.assignedHouseTask}</b></p>
+         <p>It's waiting in the After School section of My Day.</p>`));
+  }
 });
 
 // Reply into a family's thread
@@ -278,7 +298,7 @@ app.post('/api/admin/students/:email/message', adminAuth, async (req, res) => {
   u.chatThread.push({ from: 'admin', text, date: new Date().toLocaleString('en-US', { month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit' }) });
   u.adminReadTs = u.chatThread.length;
   saveDB();
-  if ((req.body || {}).email) await sendEmail(u.email, 'New message from Coach — Inner Champion Academy',
+  if ((req.body || {}).email !== false && u.notifyEmail !== false) await sendEmail(u.email, 'New message from Coach — Inner Champion Academy',
     brandEmail('New message from Coach', `<p>${text}</p><p>Reply any time in the Parents section of the portal.</p>`));
   res.json({ ok: true });
 });
@@ -289,8 +309,9 @@ app.post('/api/admin/bulletin', adminAuth, async (req, res) => {
   if (!text) return res.status(400).json({ error: 'Empty note' });
   const note = { text, date: new Date().toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric' }), ts: Date.now(), emailed: false };
   let sent = 0;
-  if ((req.body || {}).email) {
+  if ((req.body || {}).email !== false) {
     for (const u of Object.values(db.users)) {
+      if (u.notifyEmail === false) continue;
       if (await sendEmail(u.email, 'ICA Parent Bulletin — note from Coach', brandEmail('Parent Bulletin', `<p>${text}</p>`))) sent++;
     }
     note.emailed = sent > 0;
@@ -315,15 +336,39 @@ app.put('/api/admin/attendance', adminAuth, (req, res) => {
 
 // Portal content config: task lists, drills, prompts, live-class links (admin-editable)
 app.get('/api/admin/config', adminAuth, (req, res) => res.json({ config: db.portalConfig || {} }));
-app.put('/api/admin/config', adminAuth, (req, res) => {
-  db.portalConfig = Object.assign({}, db.portalConfig || {}, req.body || {});
+app.put('/api/admin/config', adminAuth, async (req, res) => {
+  const prev = db.portalConfig || {};
+  const body = req.body || {};
+  db.portalConfig = Object.assign({}, prev, body);
   saveDB(); res.json({ ok: true });
+  // Tell families when a live class link is newly posted or changed
+  const links = [];
+  if (body.growingLink && body.growingLink !== prev.growingLink) links.push(['🧠 Growing Our Brain', body.growingLink, 'creative meditation + creative work']);
+  if (body.movingLink && body.movingLink !== prev.movingLink) links.push(['🤸 Moving Our Body', body.movingLink, 'live class · Saturdays & Sundays 7:00 AM PST']);
+  if (!links.length) return;
+  const html = links.map(l => `<p><b>${l[0]}</b><br><span style="color:#6B6780">${l[2]}</span><br><a href="${l[1]}">${l[1]}</a></p>`).join('');
+  for (const u of Object.values(db.users)) {
+    if (u.notifyEmail === false) continue;
+    await sendEmail(u.email, 'Live class link posted — Inner Champion Academy',
+      brandEmail('Join us live', html + '<p>The buttons are also at the top of My Day in the portal.</p>'));
+  }
 });
 
 // PTA link for everyone
-app.put('/api/admin/pta', adminAuth, (req, res) => {
-  db.ptaLink = ((req.body || {}).link || '').trim();
+app.put('/api/admin/pta', adminAuth, async (req, res) => {
+  const link = ((req.body || {}).link || '').trim();
+  const changed = link && link !== db.ptaLink;
+  db.ptaLink = link;
   saveDB(); res.json({ ok: true });
+  if (!changed) return;
+  for (const u of Object.values(db.users)) {
+    if (u.notifyEmail === false) continue;
+    await sendEmail(u.email, 'PTA meeting link — Inner Champion Academy',
+      brandEmail('Friday PTA meeting',
+        `<p>Here's the link for our next PTA meeting (every other Friday, 9:00 AM PST):</p>
+         <p><a href="${link}">${link}</a></p>
+         <p>It's also in the Parents section of the portal.</p>`));
+  }
 });
 
 // Admin resets a family's password directly
