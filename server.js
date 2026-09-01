@@ -137,7 +137,7 @@ function adminAuth(req, res, next) {
   });
 }
 // Only these fields can be written by the student/parent client:
-const PROGRESS_FIELDS = ['notifyEmail','currentDay','completedDays','streak','dayActivities','rewardPicks','dailyDashboard','chatThread','startDate','timezone'];
+const PROGRESS_FIELDS = ['codeAccepted','notifyEmail','currentDay','completedDays','streak','dayActivities','rewardPicks','dailyDashboard','chatThread','startDate','timezone'];
 
 // ─── STUDENT / PARENT ENDPOINTS (match the portal exactly) ────────────────
 // Public self-signup is OFF by default: only accounts the admin creates can log in.
@@ -238,6 +238,8 @@ app.post('/api/reset-password', async (req, res) => {
   db.users[r.email].passwordHash = await bcrypt.hash(password, 10);
   delete db.resets[tok]; saveDB();
   res.json({ ok: true });
+  sendEmail(r.email, 'Your Inner Champion Academy password was changed',
+    brandEmail('Password changed', '<p>Your portal password was just changed. If this wasn\'t you, reply to this email right away.</p>'));
 });
 
 // ─── ADMIN ────────────────────────────────────────────────────────────────
@@ -532,6 +534,12 @@ app.post('/api/admin/students/:email/reset-password', adminAuth, async (req, res
   if (!pw || pw.length < 6) return res.status(400).json({ error: 'Password must be at least 6 characters' });
   u.passwordHash = await bcrypt.hash(pw, 10); saveDB();
   res.json({ ok: true });
+  const t = tpl('passwordChanged', 'Your Inner Champion Academy login was updated',
+    `<p>Hi! The portal password for <b>{{name}}</b> was just updated by Coach.</p>
+     <p><b>Website:</b> {{portal}}<br><b>Email:</b> {{email}}<br><b>New password:</b> {{password}}</p>
+     <p>Log in any time to pick up where your champion left off.</p>`,
+    { name: u.playerName, email: u.email, password: pw, portal: PORTAL_URL || 'the ICA portal' });
+  sendEmail(u.email, t.subject, brandEmail('Your login was updated', t.body));
 });
 
 app.get('/', (req, res) => res.json({ ok: true, service: 'ICA backend v2' }));
