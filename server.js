@@ -293,7 +293,7 @@ app.get('/api/admin/students', adminAuth, (req, res) => {
       status: u.status || 'active', notes: u.notes || '',
       createdAt: u.createdAt, lastSeen: u.lastSeen || u.lastLogin || u.createdAt,
       currentDay: u.currentDay, streak: u.streak,
-      todayColor: d.color || null, todayTasksDone: tasksDone,
+      todayColor: d.color || null, todayTasksDone: tasksDone, todayBreath: d.breath || 0,
       todayJournal: !!(d.journal || '').trim(), affirmDone: (d.affirm || 0) >= 3,
       subjects: (u.dailyDashboard && u.dailyDashboard._subjects) || [],
       rsvps: (u.dailyDashboard && u.dailyDashboard._rsvps) || {},
@@ -444,9 +444,10 @@ function buildReport(u) {
   const dash = u.dailyDashboard || {};
   const dayKeys = Object.keys(dash).filter(k => /^\d{4}-/.test(k)).sort();
   const journals = [];
-  let taskTicks = 0, colorDays = 0, affirmDays = 0;
+  let taskTicks = 0, colorDays = 0, affirmDays = 0, breathMins = 0, breathDays = 0;
   for (const k of dayKeys) {
     const d = dash[k] || {};
+    if (d.breath) { breathMins += d.breath; breathDays++; }
     taskTicks += Object.values(d.tasks || {}).filter(Boolean).length;
     if (d.color) colorDays++;
     if ((d.affirm || 0) >= 3) affirmDays++;
@@ -468,6 +469,7 @@ function buildReport(u) {
       <tr><td style="padding:7px 0;border-bottom:1px solid #EEEBFA">Longest streak</td><td align="right" style="padding:7px 0;border-bottom:1px solid #EEEBFA"><b>${u.streak || 0} days</b></td></tr>
       <tr><td style="padding:7px 0;border-bottom:1px solid #EEEBFA">Daily tasks checked off</td><td align="right" style="padding:7px 0;border-bottom:1px solid #EEEBFA"><b>${taskTicks}</b></td></tr>
       <tr><td style="padding:7px 0;border-bottom:1px solid #EEEBFA">Days affirmation said ×3</td><td align="right" style="padding:7px 0;border-bottom:1px solid #EEEBFA"><b>${affirmDays}</b></td></tr>
+      <tr><td style="padding:7px 0;border-bottom:1px solid #EEEBFA">Breathwork / meditation</td><td align="right" style="padding:7px 0;border-bottom:1px solid #EEEBFA"><b>${breathMins} min across ${breathDays} days</b></td></tr>
       <tr><td style="padding:7px 0;border-bottom:1px solid #EEEBFA">School check-ins</td><td align="right" style="padding:7px 0;border-bottom:1px solid #EEEBFA"><b>${colorDays}</b></td></tr>
       <tr><td style="padding:7px 0;border-bottom:1px solid #EEEBFA">Classes attended / confirmed</td><td align="right" style="padding:7px 0;border-bottom:1px solid #EEEBFA"><b>${attended} / ${confirmed}</b></td></tr>
       <tr><td style="padding:7px 0">Rewards earned</td><td align="right" style="padding:7px 0"><b>${rewards.length}</b></td></tr>
@@ -477,7 +479,7 @@ function buildReport(u) {
     <h3 style="color:#3A2E7C;font-size:15px;letter-spacing:.08em;text-transform:uppercase;margin:22px 0 8px">Journal &amp; check-ins</h3>
     ${journals.length ? journals.map(j => `<p style="margin:0 0 10px"><b style="color:#6B6780;font-size:12px">${j.date}</b>${j.learned ? `<br>Learned: ${esc(j.learned)}` : ''}${j.journal ? `<br><i>${esc(j.journal)}</i>` : ''}</p>`).join('') : '<p style="color:#6B6780">None recorded.</p>'}
     <p style="margin-top:24px">Every word above was written by ${esc(u.playerName)}. Keep this — it's the record of who they were becoming.</p>`;
-  return { html, stats: { daysCompleted: (u.completedDays || []).length, streak: u.streak || 0, taskTicks, affirmDays, colorDays, attended, confirmed, rewards: rewards.length, journalEntries: journals.length } };
+  return { html, stats: { breathMins, breathDays, daysCompleted: (u.completedDays || []).length, streak: u.streak || 0, taskTicks, affirmDays, colorDays, attended, confirmed, rewards: rewards.length, journalEntries: journals.length } };
 }
 
 app.get('/api/admin/students/:email/report', adminAuth, (req, res) => {
