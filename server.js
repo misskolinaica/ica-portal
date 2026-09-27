@@ -16,6 +16,14 @@
 //   FROM_EMAIL       optional — e.g. "ICA <coach@yourdomain.com>"
 //   REPLY_TO         optional — where parent replies land (default: kolina@...)
 //   PORTAL_URL       optional — used in reset-password emails
+//   ZOOM_ACCOUNT_ID / ZOOM_CLIENT_ID / ZOOM_CLIENT_SECRET
+//                    optional, NOT YET WIRED — see "ZOOM" section below.
+//                    Until a real Zoom Server-to-Server app is connected,
+//                    Coach pastes Zoom links by hand on each calendar event.
+//
+// v3 (CRM update): calendar events, RSVP confirm/decline, bulletin read
+// receipts + delete, message edit/delete/archive, conversation folders.
+// Same single-file JSON storage — redeploy this file to Railway.
 // ============================================================
 
 const express = require('express');
@@ -44,7 +52,18 @@ function loadDB() {
     if (fs.existsSync(DATA_FILE)) db = JSON.parse(fs.readFileSync(DATA_FILE, 'utf8'));
   } catch (e) { console.error('DB load failed:', e.message); }
   db.users = db.users || {}; db.resets = db.resets || {}; db.notifications = db.notifications || [];
+  // CRM additions (v3) — every older data file upgrades in place, nothing is lost.
+  //   db.calendarEvents  — null until Coach creates/imports the first event (the portal
+  //                        keeps using the old weekly schedule until then)
+  //   db.globalBulletin  — each note gains an id + readBy {email: ts} for read receipts
+  //   db.msgMeta         — admin-only thread organisation: archived threads + folders
+  if (!('calendarEvents' in db)) db.calendarEvents = null;
+  db.globalBulletin = (db.globalBulletin || []).map(n => Object.assign({ id: newId('b'), readBy: {} }, n, { readBy: n.readBy || {} }));
+  db.msgMeta = db.msgMeta || {};
+  db.msgMeta.archived = db.msgMeta.archived || {};
+  db.msgMeta.folders = db.msgMeta.folders || [];
 }
+function newId(prefix) { return (prefix || 'id') + '-' + Date.now().toString(36) + '-' + crypto.randomBytes(3).toString('hex'); }
 let saveTimer = null;
 function saveDB() {
   clearTimeout(saveTimer);
@@ -179,9 +198,72 @@ function withGlobals(u) {
   const pu = publicUser(u);
   pu.ptaLink = db.ptaLink || u.ptaLink || '';
   pu.portalConfig = db.portalConfig || {};
+  // Families see whether THEY have read each note — never who else has.
   pu.parentBulletin = [...(db.globalBulletin || []), ...(u.parentBulletin || [])]
-    .sort((a, b) => (b.ts || 0) - (a.ts || 0));
+    .sort((a, b) => (b.ts || 0) - (a.ts || 0))
+    .map(n => { const { readBy, ...rest } = n; return Object.assign(rest, { read: !!(readBy && readBy[u.email]) }); });
+  // Calendar: null = coach hasn't switched to the new calendar yet (portal uses the old schedule)
+  pu.calendarEvents = Array.isArray(db.calendarEvents) ? eventsForUser(u) : null;
   return pu;
+}
+
+// ─── CALENDAR HELPERS ─────────────────────────────────────────────────────
+const EVENT_TYPES = ['VEGAS Yoga Class', 'MOVING OUR BODY - ONLINE Yoga Class', 'GROWING OUR BRAIN - art meditations', 'ICA Event', '1:1 LEADER', 'PTA MEETING'];
+// Group events with no attendee list are for every active champion; otherwise only listed champions.
+function eventIsFor(ev, email) {
+  if (!ev) return false;
+  if (ev.type === 'PTA MEETING' && !(ev.attendees || []).length) return true;
+  if (ev.mode === 'one') return (ev.attendees || [])[0] === email;
+  return !(ev.attendees || []).length || ev.attendees.includes(email);
+}
+function eventsForUser(u) {
+  // Families never receive the full attendee list of other people's events.
+  return (db.calendarEvents || []).filter(ev => eventIsFor(ev, u.email))
+    .map(ev => { const { attendees, ...rest } = ev; return Object.assign(rest, { invitedCount: (attendees || []).length }); });
+}
+function cleanEvent(body, prev) {
+  const b = body || {}, p = prev || {};
+  const pick = (k, d) => (k in b ? b[k] : (k in p ? p[k] : d));
+  const ev = {
+    id: p.id || b.id || newId('ev'),
+    type: EVENT_TYPES.includes(pick('type')) ? pick('type') : EVENT_TYPES[0],
+    title: String(pick('title', '') || '').slice(0, 140),
+    date: String(pick('date', '') || ''),
+    start: String(pick('start', '') || ''),
+    end: String(pick('end', '') || ''),
+    recur: ['none', 'weekly', 'biweekly'].includes(pick('recur')) ? pick('recur') : 'none',
+    days: Array.isArray(pick('days')) ? pick('days').map(Number).filter(n => n >= 0 && n <= 6) : [],
+    until: String(pick('until', '') || ''),
+    skip: Array.isArray(pick('skip')) ? pick('skip').map(String) : [],
+    location: String(pick('location', '') || '').slice(0, 200),
+    zoomLink: String(pick('zoomLink', '') || '').slice(0, 500),
+    mode: pick('mode') === 'one' ? 'one' : 'group',
+    attendees: Array.isArray(pick('attendees')) ? pick('attendees').map(e => String(e).toLowerCase()) : [],
+    notes: String(pick('notes', '') || '').slice(0, 2000),
+    createdAt: p.createdAt || new Date().toISOString(),
+    updatedAt: new Date().toISOString()
+  };
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(ev.date)) return { error: 'Pick a date for the event' };
+  if (ev.mode === 'one' && ev.attendees.length !== 1) return { error: 'A 1:1 booking needs exactly one champion' };
+  if (ev.recur !== 'none' && !ev.days.length) ev.days = [new Date(ev.date + 'T00:00:00').getDay()];
+  return { ev };
+}
+
+// ─── CHAT EDIT/DELETE SAFETY ──────────────────────────────────────────────
+// The portal saves its whole chatThread through /api/progress. If a family's
+// screen still holds a message Coach edited or deleted, re-apply Coach's
+// change so a stale copy can never bring it back.
+function msgSig(m) { return (m.from || '') + '|' + (m.date || '') + '|' + (m.text || ''); }
+function applyChatTombstones(u, thread) {
+  if (!Array.isArray(thread)) return thread;
+  const dead = new Set(u.chatTombstones || []);
+  const edits = u.chatEdits || {};
+  return thread.filter(m => !(m && m.from === 'admin' && dead.has(msgSig(m)))).map(m => {
+    if (!m || m.from !== 'admin') return m;
+    let cur = m, hops = 0;
+    while (edits[msgSig(cur)] && hops++ < 10) cur = Object.assign({}, cur, { text: edits[msgSig(cur)], edited: true });
+    return cur;
+  });
 }
 
 app.get('/api/me', studentAuth, (req, res) => {
@@ -192,7 +274,31 @@ app.get('/api/me', studentAuth, (req, res) => {
 
 app.put('/api/progress', studentAuth, (req, res) => {
   for (const k of PROGRESS_FIELDS) if (k in (req.body || {})) req.user[k] = req.body[k];
+  if ('chatThread' in (req.body || {})) req.user.chatThread = applyChatTombstones(req.user, req.user.chatThread);
   req.user.lastSeen = new Date().toISOString();
+  saveDB(); res.json({ ok: true });
+});
+
+// RSVP: champion/parent answers one event occurrence. key = 'YYYY-MM-DD|eventId'
+// answer = 'yes' | 'no' | null (clear). Stored in the same dailyDashboard._rsvps
+// (yes only — what roll call reads) + _rsvpAnswered (yes/no) the portal already uses.
+app.post('/api/rsvp', studentAuth, (req, res) => {
+  const { key, answer } = req.body || {};
+  if (!key || !/^\d{4}-\d{2}-\d{2}\|/.test(key)) return res.status(400).json({ error: 'Missing event key' });
+  const dash = req.user.dailyDashboard = req.user.dailyDashboard || {};
+  dash._rsvps = dash._rsvps || {}; dash._rsvpAnswered = dash._rsvpAnswered || {};
+  if (answer === 'yes') { dash._rsvps[key] = true; dash._rsvpAnswered[key] = 'yes'; }
+  else if (answer === 'no') { delete dash._rsvps[key]; dash._rsvpAnswered[key] = 'no'; }
+  else { delete dash._rsvps[key]; delete dash._rsvpAnswered[key]; }
+  saveDB(); res.json({ ok: true });
+});
+
+// Bulletin read receipt from the Parents screen
+app.post('/api/bulletin/:id/read', studentAuth, (req, res) => {
+  const n = (db.globalBulletin || []).find(x => x.id === req.params.id);
+  if (!n) return res.status(404).json({ error: 'Note not found' });
+  n.readBy = n.readBy || {};
+  n.readBy[req.user.email] = Date.now();
   saveDB(); res.json({ ok: true });
 });
 
@@ -297,6 +403,8 @@ app.get('/api/admin/students', adminAuth, (req, res) => {
       todayJournal: !!(d.journal || '').trim(), affirmDone: (d.affirm || 0) >= 3,
       subjects: (u.dailyDashboard && u.dailyDashboard._subjects) || [],
       rsvps: (u.dailyDashboard && u.dailyDashboard._rsvps) || {},
+      rsvpAnswered: (u.dailyDashboard && u.dailyDashboard._rsvpAnswered) || {},
+      archived: !!db.msgMeta.archived[u.email],
       rewardsCount: (u.rewards || []).length,
       assignedHouseTask: u.assignedHouseTask || '',
       lastMessage: last ? { from: last.from, text: last.text, date: last.date } : null,
@@ -356,6 +464,11 @@ app.put('/api/admin/students/:email/email', adminAuth, async (req, res) => {
       db.attendance[key][newEm] = true;
     }
   }
+  // ...and calendar invites, bulletin read receipts, archive flag + folders
+  for (const ev of (db.calendarEvents || [])) ev.attendees = (ev.attendees || []).map(e => e === oldEm ? newEm : e);
+  for (const n of (db.globalBulletin || [])) if (n.readBy && n.readBy[oldEm]) { n.readBy[newEm] = n.readBy[oldEm]; delete n.readBy[oldEm]; }
+  if (db.msgMeta.archived[oldEm]) { db.msgMeta.archived[newEm] = true; delete db.msgMeta.archived[oldEm]; }
+  for (const f of db.msgMeta.folders) f.members = (f.members || []).map(e => e === oldEm ? newEm : e);
   saveDB();
   res.json({ ok: true, email: newEm });
 
@@ -418,7 +531,7 @@ app.post('/api/admin/message-group', adminAuth, async (req, res) => {
 app.post('/api/admin/bulletin', adminAuth, async (req, res) => {
   const text = ((req.body || {}).text || '').slice(0, 4000);
   if (!text) return res.status(400).json({ error: 'Empty note' });
-  const note = { text, date: new Date().toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric' }), ts: Date.now(), emailed: false };
+  const note = { id: newId('b'), text, date: new Date().toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric' }), ts: Date.now(), emailed: false, readBy: {} };
   let sent = 0;
   if ((req.body || {}).email !== false) {
     for (const u of Object.values(db.users)) {
@@ -430,9 +543,33 @@ app.post('/api/admin/bulletin', adminAuth, async (req, res) => {
   }
   db.globalBulletin = db.globalBulletin || [];
   db.globalBulletin.unshift(note);
-  db.globalBulletin = db.globalBulletin.slice(0, 20);
+  // Keep up to 100 notes. Notes are only removed by Coach (after every parent has read them).
+  db.globalBulletin = db.globalBulletin.slice(0, 100);
   saveDB();
-  res.json({ ok: true, emailed: note.emailed, sent });
+  res.json({ ok: true, emailed: note.emailed, sent, id: note.id });
+});
+
+// Bulletin list with read receipts. "Active parents" = one per active champion account.
+function activeEmails() { return Object.values(db.users).filter(u => (u.status || 'active') === 'active').map(u => u.email); }
+function bulletinSummary(n) {
+  const active = activeEmails();
+  const readBy = n.readBy || {};
+  const read = active.filter(e => readBy[e]);
+  return { id: n.id, text: n.text, date: n.date, ts: n.ts, emailed: n.emailed,
+    readCount: read.length, activeCount: active.length, readBy: read,
+    pending: active.filter(e => !readBy[e]), canDelete: read.length >= active.length };
+}
+app.get('/api/admin/bulletin', adminAuth, (req, res) => {
+  res.json({ bulletins: (db.globalBulletin || []).slice().sort((a, b) => (b.ts || 0) - (a.ts || 0)).map(bulletinSummary) });
+});
+// Deleting is only allowed once 100% of active parents confirmed they read it.
+app.delete('/api/admin/bulletin/:id', adminAuth, (req, res) => {
+  const i = (db.globalBulletin || []).findIndex(x => x.id === req.params.id);
+  if (i === -1) return res.status(404).json({ error: 'Note not found' });
+  const sum = bulletinSummary(db.globalBulletin[i]);
+  if (!sum.canDelete) return res.status(409).json({ error: 'Waiting on ' + sum.pending.length + ' of ' + sum.activeCount + ' parents to confirm they have read this note.' });
+  db.globalBulletin.splice(i, 1);
+  saveDB(); res.json({ ok: true });
 });
 
 // Roll call: mark who actually attended a class. key = 'YYYY-MM-DD|slotId'
@@ -675,7 +812,124 @@ app.post('/api/admin/students/:email/reset-password', adminAuth, async (req, res
   sendEmail(u.email, t.subject, brandEmail('Your login was updated', t.body));
 });
 
-app.get('/', (req, res) => res.json({ ok: true, service: 'ICA backend v2' }));
+// ─── CALENDAR EVENTS (admin CRUD) ─────────────────────────────────────────
+// null until the first event is saved; the dashboard offers to import the old
+// weekly rhythm (keeping the old slot ids so existing RSVPs + roll call carry over).
+app.get('/api/admin/events', adminAuth, (req, res) => res.json({ events: db.calendarEvents, types: EVENT_TYPES }));
+app.post('/api/admin/events', adminAuth, (req, res) => {
+  const list = Array.isArray((req.body || {}).events) ? req.body.events : [req.body || {}];   // bulk import or single
+  const made = [];
+  for (const b of list) {
+    const r = cleanEvent(b);
+    if (r.error) return res.status(400).json({ error: r.error });
+    if ((db.calendarEvents || []).some(e => e.id === r.ev.id)) r.ev.id = newId('ev');
+    made.push(r.ev);
+  }
+  db.calendarEvents = (db.calendarEvents || []).concat(made);
+  saveDB(); res.json({ ok: true, events: made });
+});
+app.put('/api/admin/events/:id', adminAuth, (req, res) => {
+  const i = (db.calendarEvents || []).findIndex(e => e.id === req.params.id);
+  if (i === -1) return res.status(404).json({ error: 'Event not found' });
+  const r = cleanEvent(req.body, db.calendarEvents[i]);
+  if (r.error) return res.status(400).json({ error: r.error });
+  db.calendarEvents[i] = r.ev;
+  saveDB(); res.json({ ok: true, event: r.ev });
+});
+// ?date=YYYY-MM-DD removes a single occurrence of a recurring event; otherwise the whole event.
+app.delete('/api/admin/events/:id', adminAuth, (req, res) => {
+  const i = (db.calendarEvents || []).findIndex(e => e.id === req.params.id);
+  if (i === -1) return res.status(404).json({ error: 'Event not found' });
+  const one = String(req.query.date || '');
+  if (one) { const ev = db.calendarEvents[i]; ev.skip = Array.from(new Set((ev.skip || []).concat([one]))); }
+  else db.calendarEvents.splice(i, 1);
+  saveDB(); res.json({ ok: true });
+});
+
+// ─── ZOOM (stub — no Zoom API connected yet) ──────────────────────────────
+// To go live: create a Zoom "Server-to-Server OAuth" app, add ZOOM_ACCOUNT_ID,
+// ZOOM_CLIENT_ID, ZOOM_CLIENT_SECRET in Railway Variables, then replace the body of
+// createZoomMeeting() with: get a token from https://zoom.us/oauth/token
+// (grant_type=account_credentials) and POST https://api.zoom.us/v2/users/me/meetings.
+// Return { join_url }. The dashboard already calls this endpoint and fills the link in.
+async function createZoomMeeting(/* { topic, date, start, end } */) {
+  return null;   // ← the one line to swap: return the real meeting object here
+}
+app.post('/api/admin/zoom/meeting', adminAuth, async (req, res) => {
+  const configured = !!(process.env.ZOOM_ACCOUNT_ID && process.env.ZOOM_CLIENT_ID && process.env.ZOOM_CLIENT_SECRET);
+  const m = configured ? await createZoomMeeting(req.body || {}) : null;
+  if (m && m.join_url) return res.json({ ok: true, configured: true, joinUrl: m.join_url });
+  res.status(501).json({ ok: false, configured,
+    error: configured ? 'Zoom keys are set but createZoomMeeting() is still the stub — finish it in server.js.'
+                      : 'Zoom is not connected. Paste the meeting link from Zoom by hand, or add ZOOM_* keys in Railway.' });
+});
+
+// ─── MESSAGE EDIT / DELETE (Coach's own messages only) ────────────────────
+function adminMsgAt(req, res) {
+  const u = db.users[(req.params.email || '').toLowerCase()];
+  if (!u) { res.status(404).json({ error: 'Student not found' }); return null; }
+  const i = Number(req.params.idx), m = (u.chatThread || [])[i];
+  if (!m) { res.status(404).json({ error: 'Message not found' }); return null; }
+  if (m.from !== 'admin') { res.status(403).json({ error: "Only Coach's own messages can be edited or deleted" }); return null; }
+  // Optional guard against editing the wrong bubble if the thread moved underneath us
+  const expect = (req.body && req.body.expectText) || req.query.expectText;
+  if (expect && expect !== m.text) { res.status(409).json({ error: 'This thread changed — refresh and try again' }); return null; }
+  return { u, i, m };
+}
+app.put('/api/admin/students/:email/message/:idx', adminAuth, (req, res) => {
+  const r = adminMsgAt(req, res); if (!r) return;
+  const text = (((req.body || {}).text) || '').trim().slice(0, 2000);
+  if (!text) return res.status(400).json({ error: 'Empty message' });
+  r.u.chatEdits = r.u.chatEdits || {};
+  r.u.chatEdits[msgSig(r.m)] = text;
+  r.m.text = text; r.m.edited = true; r.m.editedAt = new Date().toISOString();
+  saveDB(); res.json({ ok: true });
+});
+app.delete('/api/admin/students/:email/message/:idx', adminAuth, (req, res) => {
+  const r = adminMsgAt(req, res); if (!r) return;
+  r.u.chatTombstones = (r.u.chatTombstones || []).concat([msgSig(r.m)]).slice(-500);
+  r.u.chatThread.splice(r.i, 1);
+  r.u.adminReadTs = r.u.chatThread.length;
+  saveDB(); res.json({ ok: true });
+});
+
+// ─── THREAD ARCHIVE + FOLDERS (admin-only organisation) ───────────────────
+app.get('/api/admin/msg-meta', adminAuth, (req, res) => res.json({ archived: db.msgMeta.archived, folders: db.msgMeta.folders }));
+app.put('/api/admin/threads/:email/archive', adminAuth, (req, res) => {
+  const em = (req.params.email || '').toLowerCase();
+  if (!db.users[em]) return res.status(404).json({ error: 'Student not found' });
+  if ((req.body || {}).archived === false) delete db.msgMeta.archived[em]; else db.msgMeta.archived[em] = true;
+  saveDB(); res.json({ ok: true });
+});
+app.post('/api/admin/folders', adminAuth, (req, res) => {
+  const name = (((req.body || {}).name) || '').trim().slice(0, 60);
+  if (!name) return res.status(400).json({ error: 'Name the folder' });
+  const f = { id: newId('f'), name, pinned: !!(req.body || {}).pinned, members: [], createdAt: new Date().toISOString() };
+  db.msgMeta.folders.push(f);
+  saveDB(); res.json({ ok: true, folder: f });
+});
+app.put('/api/admin/folders/:id', adminAuth, (req, res) => {
+  const f = db.msgMeta.folders.find(x => x.id === req.params.id);
+  if (!f) return res.status(404).json({ error: 'Folder not found' });
+  const b = req.body || {};
+  if ('name' in b && String(b.name).trim()) f.name = String(b.name).trim().slice(0, 60);
+  if ('pinned' in b) f.pinned = !!b.pinned;
+  if (Array.isArray(b.members)) f.members = Array.from(new Set(b.members.map(e => String(e).toLowerCase())));
+  if (b.email) {   // toggle one conversation in/out
+    const em = String(b.email).toLowerCase();
+    f.members = (f.members || []).filter(e => e !== em);
+    if (b.member !== false) f.members.push(em);
+  }
+  saveDB(); res.json({ ok: true, folder: f });
+});
+app.delete('/api/admin/folders/:id', adminAuth, (req, res) => {
+  const before = db.msgMeta.folders.length;
+  db.msgMeta.folders = db.msgMeta.folders.filter(x => x.id !== req.params.id);
+  if (db.msgMeta.folders.length === before) return res.status(404).json({ error: 'Folder not found' });
+  saveDB(); res.json({ ok: true });   // conversations themselves are untouched
+});
+
+app.get('/', (req, res) => res.json({ ok: true, service: 'ICA backend v3' }));
 
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => console.log('ICA backend v2 listening on ' + PORT));
