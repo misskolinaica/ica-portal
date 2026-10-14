@@ -46,7 +46,7 @@ const DATA_FILE = path.join(DATA_DIR, 'ica-data.json');
 const PORTAL_URL = process.env.PORTAL_URL || '';
 
 // ─── STORAGE (single JSON file; attach a Railway volume for persistence) ──
-let db = { users: {}, resets: {}, notifications: [] };
+let db = { users: {}, resets: {}, notifications: [], orgs: {} };
 function loadDB() {
   try {
     if (fs.existsSync(DATA_FILE)) db = JSON.parse(fs.readFileSync(DATA_FILE, 'utf8'));
@@ -69,6 +69,34 @@ function loadDB() {
   // `user.startDate` is left untouched — it stays in the data as history.
   db.portalConfig = db.portalConfig || {};
   if (!isSeasonDate(db.portalConfig.seasonStart)) db.portalConfig.seasonStart = DEFAULT_SEASON_START;
+  // ─── ORGANIZATIONS (v5) ───────────────────────────────────────────────
+  // Each athlete belongs to exactly one organization, and EACH ORGANIZATION
+  // runs its own 62-day season from its own start date. One school can start
+  // in September and another in October — nobody is dragged onto someone
+  // else's clock any more. db.portalConfig.seasonStart stays in the payload
+  // for older portals, but the per-org date is what actually counts.
+  db.orgs = (db.orgs && typeof db.orgs === 'object') ? db.orgs : {};
+  // Upgrading an existing data file: every seeded org inherits the season
+  // start that was already live, so no champion's day number moves today.
+  const inherited = isSeasonDate(db.portalConfig.seasonStart) ? db.portalConfig.seasonStart : DEFAULT_SEASON_START;
+  for (const s of SEED_ORGS) {
+    if (!db.orgs[s.id]) db.orgs[s.id] = { id: s.id, name: s.name, seasonStart: inherited, seasonDays: SEASON_DAYS, active: true, createdAt: new Date().toISOString() };
+  }
+  for (const id of Object.keys(db.orgs)) {
+    const o = db.orgs[id] || {};
+    db.orgs[id] = {
+      id,
+      name: String(o.name || id).slice(0, 80),
+      seasonStart: isSeasonDate(o.seasonStart) ? o.seasonStart : '',
+      seasonDays: Number(o.seasonDays) > 0 ? Number(o.seasonDays) : SEASON_DAYS,
+      active: o.active !== false,
+      createdAt: o.createdAt || new Date().toISOString()
+    };
+  }
+  if (typeof db.defaultOrgId !== 'string' || !db.orgs[db.defaultOrgId]) db.defaultOrgId = DEFAULT_ORG_ID;
+  // Squarespace → org routing, and the replay guard for order ids
+  db.signupOrgMap = (db.signupOrgMap && typeof db.signupOrgMap === 'object') ? db.signupOrgMap : {};
+  db.seenOrders = Array.isArray(db.seenOrders) ? db.seenOrders : [];
 }
 
 // ─── SEASON DAY HELPERS ───────────────────────────────────────────────────
@@ -76,6 +104,16 @@ function loadDB() {
 // itself, so day = daysElapsed + 1, clamped to 1..62.)
 const SEASON_DAYS = 62;
 const DEFAULT_SEASON_START = '2026-09-04';
+const DEFAULT_TZ = 'America/Los_Angeles';
+const DEFAULT_ORG_ID = 'community';
+// Seeded on first boot. These four ids and names are a shared contract with
+// the admin dashboard — do not rename them.
+const SEED_ORGS = [
+  { id: 'juventus',  name: 'Juventus' },
+  { id: 'tpd',       name: 'TPD' },
+  { id: 'community', name: 'COMMUNITY - ALL CLASSES' },
+  { id: 'garside',   name: 'Garside Junior High School' }
+];
 function isSeasonDate(s) {
   if (typeof s !== 'string' || !/^\d{4}-\d{2}-\d{2}$/.test(s)) return false;
   const t = Date.parse(s + 'T00:00:00Z');
@@ -86,13 +124,90 @@ function seasonStartStr() {
   return isSeasonDate(s) ? s : DEFAULT_SEASON_START;
 }
 // day number for a 'YYYY-MM-DD' calendar date, clamped into the season
-function seasonDayFor(dateStr, start) {
+function seasonDayForDate(dateStr, start) {
   const ss = isSeasonDate(start) ? start : seasonStartStr();
   if (!isSeasonDate(dateStr)) return 1;
   const elapsed = Math.round((Date.parse(dateStr + 'T00:00:00Z') - Date.parse(ss + 'T00:00:00Z')) / 86400000);
   return Math.max(1, Math.min(elapsed + 1, SEASON_DAYS));
 }
-function seasonDayNow() { return seasonDayFor(laToday()); }
+function seasonDayNow() { return seasonDayForDate(laToday()); }
+
+// ─── ORGANIZATION HELPERS ─────────────────────────────────────────────────
+function slugOrgId(s) {
+  return String(s == null ? '' : s).toLowerCase().trim()
+    .replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '').slice(0, 40);
+}
+function defaultOrgId() { return db.orgs[db.defaultOrgId] ? db.defaultOrgId : DEFAULT_ORG_ID; }
+// Any athlete with no org, or an org that no longer exists, belongs to the
+// default org. We heal the record the moment we read it, so an athlete can
+// never be orphaned by a renamed or deleted organization.
+function orgIdFor(u) {
+  const id = (u && typeof u.org === 'string') ? u.org : '';
+  if (id && db.orgs[id]) return id;
+  const def = defaultOrgId();
+  if (u && u.org !== def) u.org = def;
+  return def;
+}
+function orgFor(u) { return db.orgs[orgIdFor(u)] || null; }
+function orgHasStart(o) { return !!(o && isSeasonDate(o.seasonStart)); }
+function tzDateKey(d, tz) {
+  try { return d.toLocaleDateString('en-CA', { timeZone: tz }); } catch (e) { return d.toLocaleDateString('en-CA'); }
+}
+function tzHourOf(d, tz) {
+  try {
+    const h = d.toLocaleString('en-US', { timeZone: tz, hour12: false, hour: '2-digit' });
+    return (Number(String(h).trim()) || 0) % 24;
+  } catch (e) { return d.getHours(); }
+}
+// seasonDayFor(user) — THE day number for this athlete: counted from their own
+// organization's seasonStart, in their own timezone, keeping the 3AM rule (a
+// champion still up at 1AM is finishing the day they were working on).
+// Returns null when the organization has NOT STARTED — either no start date is
+// set yet, or the date Coach set is still in the future. That is PRE-SEASON:
+// not day zero, not a missed day, nothing closed.
+function seasonDayFor(u) {
+  const o = orgFor(u);
+  if (!orgHasStart(o)) return null;
+  const tz = (u && u.timezone) || DEFAULT_TZ;
+  const now = new Date();
+  let elapsed = Math.round((Date.parse(tzDateKey(now, tz) + 'T00:00:00Z') - Date.parse(o.seasonStart + 'T00:00:00Z')) / 86400000);
+  if (tzHourOf(now, tz) < 3 && elapsed > 0) elapsed -= 1;
+  if (elapsed < 0) return null;                       // the season has not begun yet
+  const days = o.seasonDays || SEASON_DAYS;
+  return Math.max(1, Math.min(elapsed + 1, days));
+}
+// The same number for an organization as a whole, on Coach's Pacific clock.
+function seasonDayOfOrg(o) {
+  if (!orgHasStart(o)) return null;
+  return seasonDayFor({ org: o.id, timezone: DEFAULT_TZ });
+}
+// Has this organization's season actually begun? (A date set for next month is
+// still "not started".) Per-athlete, because it turns over in their timezone.
+function orgStarted(o, u) {
+  if (!orgHasStart(o)) return false;
+  return seasonDayFor(u || { org: o.id, timezone: DEFAULT_TZ }) !== null;
+}
+// The shape the portal and the dashboard both read off the user object.
+function orgPublic(o, u) {
+  if (!o) return null;
+  return { id: o.id, name: o.name, seasonStart: o.seasonStart || '', seasonDays: o.seasonDays || SEASON_DAYS, started: orgStarted(o, u) };
+}
+function orgAthleteCount(id) {
+  let n = 0;
+  for (const u of Object.values(db.users)) if (orgIdFor(u) === id) n++;
+  return n;
+}
+function orgSummary(o) {
+  return Object.assign({}, o, { athleteCount: orgAthleteCount(o.id), seasonDay: seasonDayOfOrg(o), started: orgStarted(o) });
+}
+function orgsSummary() {
+  return Object.values(db.orgs).map(orgSummary)
+    .sort((a, b) => (a.name || '').localeCompare(b.name || '', undefined, { sensitivity: 'base' }));
+}
+function pushNotification(n) {
+  db.notifications.push(n);
+  if (db.notifications.length > 500) db.notifications = db.notifications.slice(-500);
+}
 function newId(prefix) { return (prefix || 'id') + '-' + Date.now().toString(36) + '-' + crypto.randomBytes(3).toString('hex'); }
 let saveTimer = null;
 function saveDB() {
@@ -207,6 +322,7 @@ app.post('/api/register', async (req, res) => {
     email: em, playerName, timezone: timezone || 'America/Los_Angeles',
     passwordHash: await bcrypt.hash(password, 10),
     createdAt: new Date().toISOString(), status: 'active',
+    org: defaultOrgId(),
     currentDay: 1, completedDays: [], streak: 0, dayActivities: [], rewards: [],
     startDate: new Date().toISOString().split('T')[0],
     dailyDashboard: {}, chatThread: [],
@@ -232,6 +348,11 @@ function withGlobals(u) {
   delete pu.evals;                 // belt and braces: the evaluation is coach-only
   pu.ptaLink = db.ptaLink || u.ptaLink || '';
   pu.portalConfig = db.portalConfig || {};
+  // The athlete's organization and THEIR season day. `seasonDay` is null when
+  // their organization has not started yet — the portal shows a calm
+  // "your season starts soon" screen and does not open the daily game.
+  pu.org = orgPublic(orgFor(u), u);
+  pu.seasonDay = seasonDayFor(u);
   // Families see whether THEY have read each note — never who else has.
   pu.parentBulletin = [...(db.globalBulletin || []), ...(u.parentBulletin || [])]
     .sort((a, b) => (b.ts || 0) - (a.ts || 0))
@@ -401,10 +522,14 @@ app.post('/api/admin/students', adminAuth, async (req, res) => {
   if (!playerName || !em || !password) return res.status(400).json({ error: 'Missing name, email, or password' });
   if (password.length < 6) return res.status(400).json({ error: 'Password must be at least 6 characters' });
   if (db.users[em]) return res.status(409).json({ error: 'An account with that email already exists' });
+  // Which organization this athlete joins (their season clock comes from it)
+  const wantOrg = String((req.body || {}).org || '').trim();
+  if (wantOrg && !db.orgs[wantOrg]) return res.status(400).json({ error: 'That organization does not exist' });
   db.users[em] = {
     email: em, playerName, timezone: timezone || 'America/Los_Angeles',
     passwordHash: await bcrypt.hash(password, 10),
     createdAt: new Date().toISOString(), createdByAdmin: true, status: 'active',
+    org: wantOrg || defaultOrgId(),
     currentDay: 1, completedDays: [], streak: 0, dayActivities: [], rewards: [],
     startDate: new Date().toISOString().split('T')[0],
     dailyDashboard: {}, chatThread: [],
@@ -431,8 +556,10 @@ app.get('/api/admin/students', adminAuth, (req, res) => {
     const tasksDone = Object.values(d.tasks || {}).filter(Boolean).length;
     const thread = u.chatThread || [];
     const last = thread[thread.length - 1];
+    const org = orgFor(u);
     return {
       email: u.email, playerName: u.playerName, timezone: u.timezone,
+      org: orgIdFor(u), orgName: (org && org.name) || '', seasonDay: seasonDayFor(u),
       status: u.status || 'active', notes: u.notes || '', birthYear: u.birthYear || null,
       createdAt: u.createdAt, lastSeen: u.lastSeen || u.lastLogin || u.createdAt,
       currentDay: u.currentDay, streak: u.streak,
@@ -450,8 +577,12 @@ app.get('/api/admin/students', adminAuth, (req, res) => {
       threadLen: thread.length
     };
   });
-  // The whole Academy shares one day number — sent here so the roster can say so.
+  // Each organization keeps its own season day; the orgs summary rides along so
+  // the dashboard can render its filters without a second call. seasonStart /
+  // seasonDay stay here for older dashboards.
+  saveDB();   // reading the roster heals any athlete whose org went missing
   res.json({ students, notifications: db.notifications.slice(-50).reverse(), attendance: db.attendance || {},
+    orgs: orgsSummary(), defaultOrgId: defaultOrgId(),
     seasonStart: seasonStartStr(), seasonDay: seasonDayNow(), seasonDays: SEASON_DAYS });
 });
 
@@ -460,7 +591,8 @@ app.get('/api/admin/students/:email', adminAuth, (req, res) => {
   const u = db.users[(req.params.email || '').toLowerCase()];
   if (!u) return res.status(404).json({ error: 'Student not found' });
   u.adminReadTs = (u.chatThread || []).length; saveDB();
-  res.json({ student: publicUser(u) });
+  res.json({ student: Object.assign(publicUser(u), { org: orgIdFor(u), orgName: (orgFor(u) || {}).name || '', seasonDay: seasonDayFor(u) }),
+    orgs: orgsSummary(), defaultOrgId: defaultOrgId() });
 });
 
 // Set per-student fields (house task, etc.)
@@ -864,6 +996,238 @@ app.post('/api/admin/students/:email/reset-password', adminAuth, async (req, res
   sendEmail(u.email, t.subject, brandEmail('Your login was updated', t.body));
 });
 
+// ══════════════════════════════════════════════════════════════════════════
+// ORGANIZATIONS (admin)  —  each one runs its own 62-day season
+// ══════════════════════════════════════════════════════════════════════════
+app.get('/api/admin/orgs', adminAuth, (req, res) => {
+  saveDB();   // reading heals any athlete whose org went missing
+  res.json({ orgs: orgsSummary(), defaultOrgId: defaultOrgId(), seasonDays: SEASON_DAYS });
+});
+
+app.post('/api/admin/orgs', adminAuth, (req, res) => {
+  const b = req.body || {};
+  const name = String(b.name || '').trim().slice(0, 80);
+  if (!name) return res.status(400).json({ error: 'Name the organization' });
+  let seasonStart = '';
+  if ('seasonStart' in b && b.seasonStart !== '' && b.seasonStart != null) {
+    if (!isSeasonDate(b.seasonStart))
+      return res.status(400).json({ error: 'seasonStart must be a real date in YYYY-MM-DD form (e.g. 2026-09-04), or empty until you know it.' });
+    seasonStart = b.seasonStart;
+  }
+  const base = slugOrgId(b.id || name);
+  if (!base) return res.status(400).json({ error: 'That name has no letters or numbers to make an id from' });
+  let id = base, n = 2;
+  while (db.orgs[id]) id = (base + '-' + n++).slice(0, 40);
+  db.orgs[id] = { id, name, seasonStart, seasonDays: SEASON_DAYS, active: true, createdAt: new Date().toISOString() };
+  saveDB();
+  res.json({ ok: true, org: orgSummary(db.orgs[id]), defaultOrgId: defaultOrgId() });
+});
+
+app.put('/api/admin/orgs/:id', adminAuth, (req, res) => {
+  const o = db.orgs[req.params.id];
+  if (!o) return res.status(404).json({ error: 'Organization not found' });
+  const b = req.body || {};
+  // A bad date would move a whole school's day number, so it is rejected
+  // outright and NOTHING on the record changes.
+  if ('seasonStart' in b) {
+    if (b.seasonStart === '' || b.seasonStart === null) { /* clear → pre-season */ }
+    else if (!isSeasonDate(b.seasonStart))
+      return res.status(400).json({ error: 'seasonStart must be a real date in YYYY-MM-DD form (e.g. 2026-09-04), or empty to clear it.' });
+  }
+  if ('name' in b) {
+    const name = String(b.name || '').trim().slice(0, 80);
+    if (!name) return res.status(400).json({ error: 'Name the organization' });
+    o.name = name;
+  }
+  if ('seasonStart' in b) o.seasonStart = isSeasonDate(b.seasonStart) ? b.seasonStart : '';
+  if ('active' in b) o.active = !!b.active;
+  if ('seasonDays' in b && Number(b.seasonDays) > 0) o.seasonDays = Math.min(366, Math.round(Number(b.seasonDays)));
+  saveDB();
+  res.json({ ok: true, org: orgSummary(o) });
+});
+
+// Deleting an organization never deletes an athlete: everyone in it moves to
+// the default org, keeping every day, journal entry and reward they earned.
+app.delete('/api/admin/orgs/:id', adminAuth, (req, res) => {
+  const id = req.params.id;
+  const o = db.orgs[id];
+  if (!o) return res.status(404).json({ error: 'Organization not found' });
+  if (id === defaultOrgId())
+    return res.status(409).json({ error: 'This is the default organization — every athlete without an org lands here, so it cannot be deleted. Make another organization the default first.' });
+  const to = defaultOrgId();
+  let moved = 0;
+  for (const u of Object.values(db.users)) {
+    if ((typeof u.org === 'string' ? u.org : '') === id) { u.org = to; moved++; }
+  }
+  delete db.orgs[id];
+  // any product→org routing that pointed here stops pointing at a ghost
+  for (const k of Object.keys(db.signupOrgMap || {})) if (db.signupOrgMap[k] === id) delete db.signupOrgMap[k];
+  saveDB();
+  res.json({ ok: true, moved, movedTo: to, movedToName: (db.orgs[to] || {}).name || to });
+});
+
+// Move one athlete between organizations (their season day follows the org)
+app.put('/api/admin/students/:email/org', adminAuth, (req, res) => {
+  const u = db.users[(req.params.email || '').toLowerCase()];
+  if (!u) return res.status(404).json({ error: 'Student not found' });
+  const id = String((req.body || {}).org || '').trim();
+  if (!id || !db.orgs[id]) return res.status(400).json({ error: 'Pick an organization that exists' });
+  u.org = id;
+  saveDB();
+  res.json({ ok: true, email: u.email, org: id, orgName: db.orgs[id].name, seasonDay: seasonDayFor(u) });
+});
+
+// ══════════════════════════════════════════════════════════════════════════
+// SQUARESPACE / ZAPIER SUBSCRIPTION → ACCOUNT + WELCOME EMAIL
+//
+// POST /api/signup/subscription          (NOT behind adminAuth)
+// Auth: header `x-ica-signup-secret: <SIGNUP_SECRET>` OR `?secret=...`
+// (Zapier and Make cannot always set headers). SIGNUP_SECRET lives in Railway
+// Variables; with it unset, every call is rejected.
+// ══════════════════════════════════════════════════════════════════════════
+// Readable temp password: no 0/O/1/l/I, so a parent can retype it off a phone.
+const PW_ALPHABET = 'ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz23456789';
+function tempPassword(len) {
+  const n = Math.max(12, len || 14);
+  const limit = Math.floor(256 / PW_ALPHABET.length) * PW_ALPHABET.length;   // reject bias
+  let out = '';
+  while (out.length < n) {
+    for (const byte of crypto.randomBytes(n * 2)) {
+      if (byte >= limit) continue;
+      out += PW_ALPHABET[byte % PW_ALPHABET.length];
+      if (out.length >= n) break;
+    }
+  }
+  return out;
+}
+function signupSecretOk(req) {
+  const want = process.env.SIGNUP_SECRET || '';
+  if (!want) return false;
+  const got = String(req.headers['x-ica-signup-secret'] || (req.query || {}).secret || '');
+  if (!got) return false;
+  const a = Buffer.from(got), b = Buffer.from(want);
+  if (a.length !== b.length) return false;
+  try { return crypto.timingSafeEqual(a, b); } catch (e) { return false; }
+}
+function firstString(list) {
+  for (const v of list) if (typeof v === 'string' && v.trim()) return v.trim();
+  return '';
+}
+function signupEmail(b) {
+  const ba = b.billingAddress || b.billing_address || {};
+  return firstString([b.email, b.customerEmail, b.customer_email, ba.email]).toLowerCase();
+}
+function signupName(b, em) {
+  const ba = b.billingAddress || b.billing_address || {};
+  const joined = [ba.firstName || ba.first_name || '', ba.lastName || ba.last_name || ''].join(' ');
+  return (firstString([b.name, b.playerName, b.player_name, b.customerName, b.customer_name, joined])
+    || String(em).split('@')[0] || 'Champion').slice(0, 80);
+}
+// An exact org id wins; then productName/sku through the coach-editable map;
+// then the default organization. Nobody ever lands nowhere.
+function signupOrg(b) {
+  const direct = String(b.org || '').trim();
+  if (direct && db.orgs[direct]) return direct;
+  const map = db.signupOrgMap || {};
+  for (const k of ['productName', 'product_name', 'product', 'sku', 'productId', 'product_id']) {
+    const v = b[k];
+    if (typeof v !== 'string' || !v.trim()) continue;
+    const hit = map[v.trim().toLowerCase()];
+    if (hit && db.orgs[hit]) return hit;
+  }
+  return defaultOrgId();
+}
+
+app.post('/api/signup/subscription', async (req, res) => {
+  if (!signupSecretOk(req)) return res.status(401).json({ error: 'Not authorised' });
+  const b = req.body || {};
+  const em = signupEmail(b);
+  if (!em || !/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(em)) return res.status(400).json({ error: 'An email address is required' });
+  const orderId = (b.orderId == null ? '' : String(b.orderId)).trim().slice(0, 120);
+  const name = signupName(b, em);
+  const org = signupOrg(b);
+  const stamp = typeof b.timestamp === 'string' ? b.timestamp.slice(0, 40) : null;
+  try {
+    // Replay guard: Squarespace and Zapier both retry, so the same order only
+    // ever creates one account.
+    db.seenOrders = Array.isArray(db.seenOrders) ? db.seenOrders : [];
+    if (orderId && db.seenOrders.indexOf(orderId) !== -1) return res.json({ ok: true, created: false, duplicate: true });
+    if (orderId) {
+      db.seenOrders.push(orderId);
+      if (db.seenOrders.length > 2000) db.seenOrders = db.seenOrders.slice(-2000);
+    }
+    // Already a family here: no duplicate account, and NEVER a fresh set of
+    // credentials by email — that would hand anyone who knows the address a
+    // working login. Coach sees it in the signups list instead.
+    if (db.users[em]) {
+      pushNotification({ type: 'signup-existing', email: em, name, org, orderId: orderId || null, timestamp: stamp, ts: Date.now() });
+      saveDB();
+      return res.json({ ok: true, created: false });
+    }
+    const pw = tempPassword(14);
+    db.users[em] = {
+      email: em, playerName: name, timezone: DEFAULT_TZ,
+      passwordHash: await bcrypt.hash(pw, 10),
+      createdAt: new Date().toISOString(), createdBySignup: true, status: 'active',
+      org,
+      signup: { orderId: orderId || null, timestamp: stamp, productName: firstString([b.productName, b.product_name, b.product, b.sku]) || null },
+      currentDay: 1, completedDays: [], streak: 0, dayActivities: [], rewards: [],
+      startDate: new Date().toISOString().split('T')[0],
+      dailyDashboard: {}, chatThread: [],
+      assignedHouseTask: '', parentBulletin: []
+    };
+    pushNotification({ type: 'signup', email: em, name, org, orderId: orderId || null, timestamp: stamp, ts: Date.now() });
+    saveDB();
+
+    // An email that will not send must never fail the webhook — Squarespace
+    // would retry forever and the account already exists.
+    let emailed = false, why = null;
+    try {
+      const t = tpl('welcome',
+        'Welcome to the Inner Champion Academy Portal!',
+        `<p>Your champion's portal account is ready.</p>
+         <p><b>Website:</b> {{portal}}<br><b>Email:</b> {{email}}<br><b>Temporary password:</b> {{password}}</p>
+         <p>Log in together and set up your first day — daily tasks, journal, class RSVPs, and messages with Coach are all inside.</p>`,
+        { name, email: em, password: pw, portal: PORTAL_URL || 'the ICA portal' });
+      emailed = await sendEmail(em, t.subject, brandEmail('Welcome, ' + name + '!', t.body));
+      if (!emailed) why = (lastEmail && lastEmail.error) || 'the email was not accepted';
+    } catch (e) { why = e.message; }
+    if (!emailed) console.error('SIGNUP: account created for', em, 'but the welcome email did not send ::', why);
+    res.json({ ok: true, created: true, emailed, org });
+  } catch (e) {
+    console.error('signup webhook failed:', e.message);
+    res.status(500).json({ error: 'Signup could not be processed' });
+  }
+});
+
+// Recent Squarespace signups + the product→org routing map
+app.get('/api/admin/signups', adminAuth, (req, res) => {
+  const signups = (db.notifications || [])
+    .filter(n => n && (n.type === 'signup' || n.type === 'signup-existing'))
+    .slice(-100).reverse()
+    .map(n => Object.assign({}, n, { orgName: (db.orgs[n.org] || {}).name || n.org || '' }));
+  res.json({ signups, map: db.signupOrgMap || {},
+    endpoint: '/api/signup/subscription',
+    secretConfigured: !!process.env.SIGNUP_SECRET,   // the secret itself is never sent
+    orgs: orgsSummary(), defaultOrgId: defaultOrgId() });
+});
+
+app.put('/api/admin/signup-map', adminAuth, (req, res) => {
+  const map = (req.body || {}).map;
+  if (!map || typeof map !== 'object' || Array.isArray(map)) return res.status(400).json({ error: 'Send { map: { "product name": "orgId" } }' });
+  const next = {};
+  for (const k of Object.keys(map)) {
+    const key = String(k || '').trim().toLowerCase().slice(0, 120);
+    const val = String(map[k] || '').trim();
+    if (!key) continue;
+    if (!db.orgs[val]) return res.status(400).json({ error: '"' + key + '" points at an organization that does not exist: ' + val });
+    next[key] = val;
+  }
+  db.signupOrgMap = next;
+  saveDB();
+  res.json({ ok: true, map: db.signupOrgMap });
+});
+
 // ─── CALENDAR EVENTS (admin CRUD) ─────────────────────────────────────────
 // null until the first event is saved; the dashboard offers to import the old
 // weekly rhythm (keeping the old slot ids so existing RSVPs + roll call carry over).
@@ -1227,7 +1591,7 @@ function buildWeeklyDigest(u, ws) {
       <tr><td style="${cell}">Journal entries</td><td align="right" style="${cell}"><b>${auto.journalDays}</b></td></tr>
       <tr><td style="${cell}">Screen time logged</td><td align="right" style="${cell}"><b>${auto.screenMins} min</b></td></tr>
       <tr><td style="${cell}">Classes attended</td><td align="right" style="${cell}"><b>${auto.attended} of ${auto.expected}</b></td></tr>
-      <tr><td style="padding:7px 0">Game day</td><td align="right" style="padding:7px 0"><b>Day ${esc(u.currentDay || 1)} · ${esc(u.streak || 0)}-day streak</b></td></tr>
+      <tr><td style="padding:7px 0">Game day</td><td align="right" style="padding:7px 0"><b>${seasonDayFor(u) === null ? 'Season starts soon' : 'Day ' + esc(seasonDayFor(u))} · ${esc(u.streak || 0)}-day streak</b></td></tr>
     </table>
     <h3 style="color:#3A2E7C;font-size:15px;letter-spacing:.08em;text-transform:uppercase;margin:22px 0 8px">Day by day</h3>
     ${dayHtml}
@@ -1312,7 +1676,9 @@ async function weeklyTick() {
 setInterval(weeklyTick, 5 * 60 * 1000);
 setTimeout(weeklyTick, 60 * 1000);   // also check a minute after boot/redeploy
 
-app.get('/', (req, res) => res.json({ ok: true, service: 'ICA backend v4' }));
+app.get('/', (req, res) => res.json({ ok: true, service: 'ICA backend v5',
+  // booleans only — never the values themselves. Lets Coach confirm setup at a glance.
+  email: !!process.env.RESEND_API_KEY, signup: !!process.env.SIGNUP_SECRET }));
 
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => console.log('ICA backend v2 listening on ' + PORT));
